@@ -1,0 +1,13 @@
+numpy==1.26.4
+opencv-python
+insightface==0.7.3
+onnxruntime-silicon
+gfpgan
+basicsr
+realesrgan
+tqdm
+requests
+protobuf==3.20.3
+torch
+torchvision
+torchaudio

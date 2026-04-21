@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+swap_env/
+.venv/
+venv/
+env/
+
+# Local runtime caches and downloaded weights
+.insightface/
+gfpgan/weights/
+swap_env/lib/python*/site-packages/weights/
+
+# Generated outputs and intermediates
+output/
+*.incomplete.mp4
+*.swap.mp4
+*.superres.mp4
+*.export.mp4
+*.muxed.mp4
+
+# Local input media
+source_face.jpg
+target/
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
