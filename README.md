@@ -44,7 +44,17 @@ pip install -r requirements.txt
 Place these files in the models directory:
 
 - models/inswapper_128.onnx
+	Download: https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx
 - models/GFPGANv1.3.pth
+	Download: https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth
+
+Example:
+
+```bash
+mkdir -p models
+curl -L https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx -o models/inswapper_128.onnx
+curl -L https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth -o models/GFPGANv1.3.pth
+```
 
 RealESRGAN weights download automatically on first use unless you provide `--superres-model-path`.
 
