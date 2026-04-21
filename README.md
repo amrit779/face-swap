@@ -80,6 +80,7 @@ By default, the script expects:
 
 Each output file keeps the same basename as its source video.
 In directory mode, each source video is deleted from `target/` after its output is finalized successfully.
+Use `--workers N` to process multiple target videos in parallel when running against a directory.
 
 Single-video example:
 
@@ -122,11 +123,14 @@ Relevant options:
 
 - `--det-size WIDTH HEIGHT`: larger detection size can help difficult faces but costs speed.
 - `--detection-interval N`: `1` means detect every frame. Higher values rely more on tracking.
-- `--enhancement-interval N`: `1` enhances every swapped frame. Higher values enhance fewer frames.
+- `--enhancement-interval N`: `1` enhances every swapped frame. Higher values enhance fewer frames and can introduce visible flicker.
+- `--enhancement-workers N`: number of CPU worker processes for the GFPGAN enhancement pass on a single video. This preserves frame order and is automatically disabled when batch video workers are already in use.
 - `--identity-threshold X`: minimum embedding similarity required to keep swapping the same person.
 - `--color-match-strength X`: strength of landmark-masked local face color correction from `0.0` to `1.0`.
+- `--track-smoothing X`: temporal smoothing for tracked face geometry from `0.0` to `0.95`. Higher values reduce jitter.
 - `--superres-model NAME`: RealESRGAN model used for final video super-resolution.
 - `--superres-model-path PATH_OR_URL`: optional custom RealESRGAN weights path or URL.
+- `--workers N`: number of parallel worker processes for directory-based batch runs.
 - `--export-scale X`: RealESRGAN outscale factor. `1.0` skips the super-resolution pass.
 - `--export-crf N`: lower CRF means higher visual quality in the final x264 export.
 - `--export-preset NAME`: x264 preset for the final export pass.
@@ -141,6 +145,7 @@ FACE_SWAP_LOG_LEVEL=INFO ./swap_env/bin/python swap_script.py \
 	--skip-enhancement \
 	--target target \
 	--output output \
+	--workers 2 \
 	--det-size 320 320 \
 	--detection-interval 4 \
 	--progress-every 10
@@ -155,6 +160,7 @@ FACE_SWAP_LOG_LEVEL=INFO ./swap_env/bin/python swap_script.py \
 	--det-size 640 640 \
 	--detection-interval 2 \
 	--enhancement-interval 2 \
+	--enhancement-workers 2 \
 	--identity-threshold 0.35 \
 	--color-match-strength 0.35 \
 	--export-crf 18 \
@@ -172,6 +178,7 @@ FACE_SWAP_LOG_LEVEL=INFO ./swap_env/bin/python swap_script.py \
 	--enhancement-interval 1 \
 	--identity-threshold 0.35 \
 	--color-match-strength 0.45 \
+	--track-smoothing 0.65 \
 	--export-scale 1.25 \
 	--export-crf 16 \
 	--export-preset slow
@@ -225,6 +232,8 @@ If the wrong person is swapped:
 If the swap looks unstable:
 
 - Set `--detection-interval 1`.
+- Keep `--enhancement-interval 1` so GFPGAN does not change appearance only on some frames.
+- Increase `--track-smoothing` slightly, for example from `0.65` to `0.75`, if the face jitters.
 - Use a clearer source photo with a more frontal face.
 - Use a less compressed target video.
 

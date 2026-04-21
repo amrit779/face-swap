@@ -21,6 +21,7 @@ env/
 .insightface/
 gfpgan/weights/
 swap_env/lib/python*/site-packages/weights/
+models/
 
 # Generated outputs and intermediates
 output/

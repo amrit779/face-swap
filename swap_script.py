@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 import cv2
 import insightface
 import importlib
@@ -42,15 +43,19 @@ LOGGER = logging.getLogger('face_swap')
 DEFAULT_ALLOWED_MODULES = ('detection', 'recognition')
 DEFAULT_PROGRESS_EVERY = 25
 DEFAULT_DETECTION_INTERVAL = 1
-DEFAULT_ENHANCEMENT_INTERVAL = 5
+DEFAULT_ENHANCEMENT_INTERVAL = 1
 DEFAULT_IDENTITY_THRESHOLD = 0.35
 DEFAULT_COLOR_MATCH_STRENGTH = 0.35
+DEFAULT_TRACK_SMOOTHING = 0.65
 DEFAULT_EXPORT_SCALE = 1.0
 DEFAULT_EXPORT_CRF = 18
 DEFAULT_EXPORT_PRESET = 'slow'
 DEFAULT_SUPERRES_MODEL_NAME = 'RealESRGAN_x4plus'
 DEFAULT_SUPERRES_TILE = 256
 DEFAULT_SUPERRES_TILE_PAD = 16
+DEFAULT_WORKERS = 2
+DEFAULT_ENHANCEMENT_WORKERS = 1
+DEFAULT_ENHANCEMENT_CHUNK_SIZE = 8
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.m4v', '.avi', '.mkv'}
 SUPERRES_MODEL_CONFIGS = {
     'RealESRGAN_x4plus': {
@@ -65,6 +70,7 @@ SUPERRES_MODEL_CONFIGS = {
         },
     },
 }
+_ENHANCEMENT_WORKER = None
 
 
 def _validate_file(path_str, label):
@@ -255,6 +261,27 @@ def _track_face(prev_gray, frame_gray, tracked_face):
     )
 
 
+def _smooth_target_face(previous_face, current_face, smoothing):
+    if previous_face is None or current_face is None or smoothing <= 0:
+        return current_face
+
+    smoothing = min(max(float(smoothing), 0.0), 0.95)
+    prev_bbox = np.asarray(previous_face.bbox, dtype=np.float32)
+    curr_bbox = np.asarray(current_face.bbox, dtype=np.float32)
+    prev_kps = np.asarray(previous_face.kps, dtype=np.float32)
+    curr_kps = np.asarray(current_face.kps, dtype=np.float32)
+
+    if prev_kps.shape != curr_kps.shape:
+        return current_face
+
+    return SimpleNamespace(
+        bbox=smoothing * prev_bbox + (1.0 - smoothing) * curr_bbox,
+        kps=smoothing * prev_kps + (1.0 - smoothing) * curr_kps,
+        det_score=getattr(current_face, 'det_score', getattr(previous_face, 'det_score', 1.0)),
+        normed_embedding=getattr(current_face, 'normed_embedding', getattr(previous_face, 'normed_embedding', None)),
+    )
+
+
 def _select_identity_face(faces, locked_embedding, identity_threshold, frame_index):
     if not faces:
         return None, locked_embedding
@@ -350,6 +377,7 @@ def _resolve_target_face(
     detection_interval,
     locked_embedding,
     identity_threshold,
+    track_smoothing,
 ):
     frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     should_detect = (
@@ -367,6 +395,7 @@ def _resolve_target_face(
             identity_threshold,
         )
         if target_face is not None:
+            target_face = _smooth_target_face(tracked_face, target_face, track_smoothing)
             LOGGER.debug('Frame %s used fresh detection', frame_index)
         return target_face, frame_gray, locked_embedding
 
@@ -382,6 +411,7 @@ def _resolve_target_face(
 
     tracked = _track_face(prev_gray, frame_gray, tracked_face)
     if tracked is not None:
+        tracked = _smooth_target_face(tracked_face, tracked, track_smoothing)
         LOGGER.debug('Frame %s reused tracked face', frame_index)
         return tracked, frame_gray, locked_embedding
 
@@ -393,6 +423,8 @@ def _resolve_target_face(
         locked_embedding,
         identity_threshold,
     )
+    if target_face is not None:
+        target_face = _smooth_target_face(tracked_face, target_face, track_smoothing)
     return target_face, frame_gray, locked_embedding
 
 
@@ -608,6 +640,116 @@ def _log_enhancement_progress(frame_index, enhanced_frames, total_frames, start_
     )
 
 
+def _init_enhancement_worker(enhancer_model_path):
+    global _ENHANCEMENT_WORKER
+    _ENHANCEMENT_WORKER = _create_face_enhancer(enhancer_model_path, 'cpu', skip_enhancement=False)
+
+
+def _enhance_frame_batch(frame_batch):
+    if _ENHANCEMENT_WORKER is None:
+        raise RuntimeError('Enhancement worker was not initialized')
+
+    enhanced_batch = []
+    for frame_index, frame in frame_batch:
+        _, _, enhanced_frame = _ENHANCEMENT_WORKER.enhance(
+            frame,
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True,
+        )
+        enhanced_batch.append((frame_index, enhanced_frame))
+    return enhanced_batch
+
+
+def _submit_enhancement_chunk(executor, frame_batch, futures):
+    if not frame_batch:
+        return []
+
+    future = executor.submit(_enhance_frame_batch, tuple(frame_batch))
+    futures[future] = len(frame_batch)
+    return []
+
+
+def _collect_enhancement_results(done_futures, futures, pending_frames):
+    enhanced_count = 0
+    for future in done_futures:
+        enhanced_count += futures.pop(future)
+        for frame_index, enhanced_frame in future.result():
+            pending_frames[frame_index] = enhanced_frame
+    return enhanced_count
+
+
+def _flush_ready_frames(out, pending_frames, next_write_index):
+    while next_write_index in pending_frames:
+        out.write(pending_frames.pop(next_write_index))
+        next_write_index += 1
+    return next_write_index
+
+
+def _drain_enhancement_futures(futures, pending_frames, wait_for_result=False):
+    if not futures:
+        return 0
+
+    if wait_for_result:
+        done_futures, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+    else:
+        done_futures = {future for future in tuple(futures) if future.done()}
+
+    if not done_futures:
+        return 0
+    return _collect_enhancement_results(done_futures, futures, pending_frames)
+
+
+def _resolve_enhancement_decision(frame_index, swapped_frame_indices, swapped_seen, enhancement_interval):
+    if frame_index not in swapped_frame_indices:
+        return False, swapped_seen
+
+    swapped_seen += 1
+    should_enhance = ((swapped_seen - 1) % enhancement_interval == 0)
+    return should_enhance, swapped_seen
+
+
+def _maybe_log_enhancement_flush(
+    out,
+    pending_frames,
+    next_write_index,
+    enhanced_frames,
+    total_frames,
+    start_time,
+    progress_every,
+):
+    previous_write_index = next_write_index
+    next_write_index = _flush_ready_frames(out, pending_frames, next_write_index)
+    if next_write_index != previous_write_index:
+        _log_enhancement_progress(
+            next_write_index - 1,
+            enhanced_frames,
+            total_frames,
+            start_time,
+            progress_every,
+        )
+    return next_write_index
+
+
+def _handle_parallel_enhancement_frame(
+    executor,
+    frame_batch,
+    futures,
+    pending_frames,
+    frame_index,
+    frame,
+    should_enhance,
+):
+    if should_enhance:
+        frame_batch.append((frame_index, frame))
+        if len(frame_batch) >= DEFAULT_ENHANCEMENT_CHUNK_SIZE:
+            frame_batch = _submit_enhancement_chunk(executor, frame_batch, futures)
+        return frame_batch
+
+    pending_frames[frame_index] = frame
+    return frame_batch
+
+
 def _find_binary(name):
     return shutil.which(name)
 
@@ -815,6 +957,145 @@ def _remove_completed_target_video(target_video_path, batch_mode):
     target_video_path.unlink()
 
 
+def _process_single_video(
+    source_path,
+    target_video_path,
+    output_path,
+    det_size,
+    skip_enhancement,
+    providers,
+    progress_every,
+    quality_settings,
+    batch_mode,
+    batch_index=None,
+    batch_total=None,
+):
+    source_path = Path(source_path)
+    target_video_path = Path(target_video_path)
+    output_path = Path(output_path)
+    enhancer_model_path = _resolve_base_paths(source_path)['enhancer_model_path']
+
+    resolved_output_path = _resolve_output_path(target_video_path, output_path, batch_mode=batch_mode)
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    final_temp_output_path = _get_temp_output_path(resolved_output_path, marker='incomplete')
+    swap_temp_output_path = _get_temp_output_path(resolved_output_path, marker='swap')
+    _cleanup_temp_file(final_temp_output_path)
+    _cleanup_temp_file(swap_temp_output_path)
+
+    if batch_index is not None and batch_total is not None:
+        LOGGER.info('Processing video %s/%s: %s', batch_index, batch_total, target_video_path.name)
+    else:
+        LOGGER.info('Processing video: %s', target_video_path.name)
+
+    swap_output_path = swap_temp_output_path if not skip_enhancement else final_temp_output_path
+    LOGGER.info('Writing swap pass output to %s', swap_output_path)
+    frame_index, swapped_frames, swapped_frame_indices = _run_swap_pass(
+        source_path,
+        target_video_path,
+        swap_output_path,
+        det_size,
+        providers,
+        progress_every,
+        quality_settings.detection_interval,
+        quality_settings.identity_threshold,
+        quality_settings.color_match_strength,
+        quality_settings.track_smoothing,
+    )
+
+    if skip_enhancement:
+        _finalize_output(
+            final_temp_output_path,
+            resolved_output_path,
+            frame_index,
+            swapped_frames,
+            target_video_path,
+            quality_settings,
+            progress_every,
+        )
+        _remove_completed_target_video(target_video_path, batch_mode)
+        return resolved_output_path
+
+    LOGGER.info('Running post-process enhancement on selected swapped frames')
+    enhancement_workers = quality_settings.enhancement_workers
+    if quality_settings.batch_workers > 1 and enhancement_workers > 1:
+        LOGGER.warning(
+            'Disabling enhancement worker parallelism for %s because batch video workers are already active',
+            target_video_path.name,
+        )
+        enhancement_workers = 1
+
+    enhanced_frame_index, enhanced_frames = _run_enhancement_pass(
+        swap_temp_output_path,
+        final_temp_output_path,
+        enhancer_model_path,
+        progress_every,
+        quality_settings.enhancement_interval,
+        swapped_frame_indices,
+        enhancement_workers,
+    )
+    if swap_temp_output_path.exists():
+        swap_temp_output_path.unlink()
+
+    LOGGER.info('Enhancement pass completed. frames=%s, enhanced_frames=%s', enhanced_frame_index, enhanced_frames)
+    _finalize_output(
+        final_temp_output_path,
+        resolved_output_path,
+        frame_index,
+        swapped_frames,
+        target_video_path,
+        quality_settings,
+        progress_every,
+    )
+    _remove_completed_target_video(target_video_path, batch_mode)
+    return resolved_output_path
+
+
+def _run_batch_parallel(
+    source_path,
+    target_videos,
+    output_path,
+    det_size,
+    skip_enhancement,
+    providers,
+    progress_every,
+    quality_settings,
+    workers,
+):
+    LOGGER.info('Running batch with %s parallel worker(s)', workers)
+    failures = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _process_single_video,
+                source_path,
+                target_video_path,
+                output_path,
+                det_size,
+                skip_enhancement,
+                providers,
+                progress_every,
+                quality_settings,
+                True,
+                index,
+                len(target_videos),
+            ): target_video_path
+            for index, target_video_path in enumerate(target_videos, start=1)
+        }
+
+        for future in as_completed(futures):
+            target_video_path = futures[future]
+            try:
+                result_path = future.result()
+                LOGGER.info('Completed %s -> %s', target_video_path.name, result_path.name)
+            except Exception as error:
+                failures.append((target_video_path, error))
+                LOGGER.error('Failed processing %s: %s', target_video_path, error)
+
+    if failures:
+        failure_names = ', '.join(path.name for path, _ in failures)
+        raise RuntimeError(f'Batch processing failed for: {failure_names}')
+
+
 def _run_swap_pass(
     source_path,
     video_path,
@@ -825,6 +1106,7 @@ def _run_swap_pass(
     detection_interval,
     identity_threshold,
     color_match_strength,
+    track_smoothing,
 ):
     app = _create_face_analysis(det_size, providers)
     swapper = _create_swapper(Path('models') / 'inswapper_128.onnx', providers)
@@ -863,6 +1145,7 @@ def _run_swap_pass(
                 detection_interval,
                 locked_embedding,
                 identity_threshold,
+                track_smoothing,
             )
             if target_face is not None:
                 frame = _swap_frame(frame, swapper, source_face, target_face, color_match_strength)
@@ -895,6 +1178,36 @@ def _run_swap_pass(
 
 
 def _run_enhancement_pass(
+    input_video_path,
+    output_path,
+    enhancer_model_path,
+    progress_every,
+    enhancement_interval,
+    swapped_frame_indices,
+    enhancement_workers,
+):
+    if enhancement_workers > 1 and len(swapped_frame_indices) >= DEFAULT_ENHANCEMENT_CHUNK_SIZE:
+        return _run_enhancement_pass_parallel(
+            input_video_path,
+            output_path,
+            enhancer_model_path,
+            progress_every,
+            enhancement_interval,
+            swapped_frame_indices,
+            enhancement_workers,
+        )
+
+    return _run_enhancement_pass_serial(
+        input_video_path,
+        output_path,
+        enhancer_model_path,
+        progress_every,
+        enhancement_interval,
+        swapped_frame_indices,
+    )
+
+
+def _run_enhancement_pass_serial(
     input_video_path,
     output_path,
     enhancer_model_path,
@@ -941,6 +1254,118 @@ def _run_enhancement_pass(
 
             out.write(frame)
             _log_enhancement_progress(frame_index, enhanced_frames, total_frames, start_time, progress_every)
+
+        completed = True
+    finally:
+        LOGGER.info('Releasing enhancement pass resources')
+        cap.release()
+        out.release()
+        if not completed and output_path.exists():
+            output_path.unlink()
+
+    return frame_index, enhanced_frames
+
+
+def _run_enhancement_pass_parallel(
+    input_video_path,
+    output_path,
+    enhancer_model_path,
+    progress_every,
+    enhancement_interval,
+    swapped_frame_indices,
+    enhancement_workers,
+):
+    LOGGER.info(
+        'Starting parallel enhancement pass with %s CPU worker(s) and chunk_size=%s',
+        enhancement_workers,
+        DEFAULT_ENHANCEMENT_CHUNK_SIZE,
+    )
+    fps, width, height, total_frames, _ = _probe_video(input_video_path)
+    LOGGER.info('Opening swapped video for enhancement')
+    cap = cv2.VideoCapture(str(input_video_path))
+    if not cap.isOpened():
+        raise ValueError(f'Failed to open swapped video: {input_video_path}')
+
+    out = _create_video_writer(output_path, fps, width, height)
+    frame_index = 0
+    enhanced_frames = 0
+    swapped_seen = 0
+    start_time = time.perf_counter()
+    completed = False
+    next_write_index = 1
+    pending_frames = {}
+    frame_batch = []
+    max_pending_futures = max(enhancement_workers * 2, 1)
+
+    try:
+        with ProcessPoolExecutor(
+            max_workers=enhancement_workers,
+            initializer=_init_enhancement_worker,
+            initargs=(str(enhancer_model_path),),
+        ) as executor:
+            futures = {}
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    LOGGER.info('Reached end of enhanced video stream after %s frames', frame_index)
+                    break
+
+                frame_index += 1
+                should_enhance, swapped_seen = _resolve_enhancement_decision(
+                    frame_index,
+                    swapped_frame_indices,
+                    swapped_seen,
+                    enhancement_interval,
+                )
+                frame_batch = _handle_parallel_enhancement_frame(
+                    executor,
+                    frame_batch,
+                    futures,
+                    pending_frames,
+                    frame_index,
+                    frame,
+                    should_enhance,
+                )
+
+                if len(futures) >= max_pending_futures:
+                    enhanced_frames += _drain_enhancement_futures(futures, pending_frames, wait_for_result=True)
+                else:
+                    enhanced_frames += _drain_enhancement_futures(futures, pending_frames)
+
+                next_write_index = _maybe_log_enhancement_flush(
+                    out,
+                    pending_frames,
+                    next_write_index,
+                    enhanced_frames,
+                    total_frames,
+                    start_time,
+                    progress_every,
+                )
+
+            frame_batch = _submit_enhancement_chunk(executor, frame_batch, futures)
+            while futures:
+                enhanced_frames += _drain_enhancement_futures(futures, pending_frames, wait_for_result=True)
+                next_write_index = _maybe_log_enhancement_flush(
+                    out,
+                    pending_frames,
+                    next_write_index,
+                    enhanced_frames,
+                    total_frames,
+                    start_time,
+                    progress_every,
+                )
+
+            next_write_index = _maybe_log_enhancement_flush(
+                out,
+                pending_frames,
+                next_write_index,
+                enhanced_frames,
+                total_frames,
+                start_time,
+                progress_every,
+            )
+            if next_write_index != frame_index + 1:
+                raise RuntimeError('Parallel enhancement did not flush all frames in order')
 
         completed = True
     finally:
@@ -999,74 +1424,43 @@ def run_swap(
     skip_enhancement,
     providers,
     progress_every,
+    workers,
     quality_settings,
 ):
     _log_run_header(source_path, video_path, output_path)
     resolved_paths = _resolve_base_paths(source_path)
     source_path = resolved_paths['source_path']
-    enhancer_model_path = resolved_paths['enhancer_model_path']
     target_videos = _collect_target_videos(video_path)
     batch_mode = Path(video_path).is_dir()
 
-    for index, target_video_path in enumerate(target_videos, start=1):
-        resolved_output_path = _resolve_output_path(target_video_path, output_path, batch_mode=batch_mode)
-        resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-        final_temp_output_path = _get_temp_output_path(resolved_output_path, marker='incomplete')
-        swap_temp_output_path = _get_temp_output_path(resolved_output_path, marker='swap')
-        _cleanup_temp_file(final_temp_output_path)
-        _cleanup_temp_file(swap_temp_output_path)
-
-        swap_output_path = swap_temp_output_path if not skip_enhancement else final_temp_output_path
-        LOGGER.info('Processing video %s/%s: %s', index, len(target_videos), target_video_path.name)
-        LOGGER.info('Writing swap pass output to %s', swap_output_path)
-        frame_index, swapped_frames, swapped_frame_indices = _run_swap_pass(
+    if batch_mode and workers > 1:
+        _run_batch_parallel(
             source_path,
-            target_video_path,
-            swap_output_path,
+            target_videos,
+            output_path,
             det_size,
+            skip_enhancement,
             providers,
             progress_every,
-            quality_settings.detection_interval,
-            quality_settings.identity_threshold,
-            quality_settings.color_match_strength,
-        )
-
-        if skip_enhancement:
-            _finalize_output(
-                final_temp_output_path,
-                resolved_output_path,
-                frame_index,
-                swapped_frames,
-                target_video_path,
-                quality_settings,
-                progress_every,
-            )
-            _remove_completed_target_video(target_video_path, batch_mode)
-            continue
-
-        LOGGER.info('Running post-process enhancement on selected swapped frames')
-        enhanced_frame_index, enhanced_frames = _run_enhancement_pass(
-            swap_temp_output_path,
-            final_temp_output_path,
-            enhancer_model_path,
-            progress_every,
-            quality_settings.enhancement_interval,
-            swapped_frame_indices,
-        )
-        if swap_temp_output_path.exists():
-            swap_temp_output_path.unlink()
-
-        LOGGER.info('Enhancement pass completed. frames=%s, enhanced_frames=%s', enhanced_frame_index, enhanced_frames)
-        _finalize_output(
-            final_temp_output_path,
-            resolved_output_path,
-            frame_index,
-            swapped_frames,
-            target_video_path,
             quality_settings,
-            progress_every,
+            workers,
         )
-        _remove_completed_target_video(target_video_path, batch_mode)
+        return
+
+    for index, target_video_path in enumerate(target_videos, start=1):
+        _process_single_video(
+            source_path,
+            target_video_path,
+            output_path,
+            det_size,
+            skip_enhancement,
+            providers,
+            progress_every,
+            quality_settings,
+            batch_mode,
+            index,
+            len(target_videos),
+        )
 
 
 def _build_parser():
@@ -1100,6 +1494,12 @@ def _build_parser():
         help='Log progress every N frames.',
     )
     parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help='Number of parallel worker processes for batch directory processing. Use 1 to disable parallelism.',
+    )
+    parser.add_argument(
         '--detection-interval',
         type=int,
         default=DEFAULT_DETECTION_INTERVAL,
@@ -1112,6 +1512,12 @@ def _build_parser():
         help='In post-process mode, enhance every Nth swapped frame. Use 1 to enhance every swapped frame.',
     )
     parser.add_argument(
+        '--enhancement-workers',
+        type=int,
+        default=DEFAULT_ENHANCEMENT_WORKERS,
+        help='Number of CPU worker processes for the GFPGAN enhancement pass. Use 1 to disable enhancement parallelism.',
+    )
+    parser.add_argument(
         '--identity-threshold',
         type=float,
         default=DEFAULT_IDENTITY_THRESHOLD,
@@ -1122,6 +1528,12 @@ def _build_parser():
         type=float,
         default=DEFAULT_COLOR_MATCH_STRENGTH,
         help='Strength of local face color correction after swapping. Use 0 to disable.',
+    )
+    parser.add_argument(
+        '--track-smoothing',
+        type=float,
+        default=DEFAULT_TRACK_SMOOTHING,
+        help='Temporal smoothing for tracked face geometry from 0.0 to 0.95. Higher values reduce jitter.',
     )
     parser.add_argument(
         '--superres-model',
@@ -1166,14 +1578,20 @@ def main(argv=None):
 
     if args.progress_every <= 0:
         parser.error('--progress-every must be greater than 0')
+    if args.workers <= 0:
+        parser.error('--workers must be greater than 0')
     if args.detection_interval <= 0:
         parser.error('--detection-interval must be greater than 0')
     if args.enhancement_interval <= 0:
         parser.error('--enhancement-interval must be greater than 0')
+    if args.enhancement_workers <= 0:
+        parser.error('--enhancement-workers must be greater than 0')
     if not 0.0 <= args.identity_threshold <= 1.0:
         parser.error('--identity-threshold must be between 0 and 1')
     if not 0.0 <= args.color_match_strength <= 1.0:
         parser.error('--color-match-strength must be between 0 and 1')
+    if not 0.0 <= args.track_smoothing <= 0.95:
+        parser.error('--track-smoothing must be between 0 and 0.95')
     if args.export_scale < 1.0:
         parser.error('--export-scale must be greater than or equal to 1.0')
     if args.export_crf < 0:
@@ -1184,13 +1602,16 @@ def main(argv=None):
     quality_settings = SimpleNamespace(
         detection_interval=args.detection_interval,
         enhancement_interval=args.enhancement_interval,
+        enhancement_workers=args.enhancement_workers,
         identity_threshold=args.identity_threshold,
         color_match_strength=args.color_match_strength,
+        track_smoothing=args.track_smoothing,
         superres_model_name=args.superres_model,
         superres_model_path=args.superres_model_path,
         export_scale=args.export_scale,
         export_crf=args.export_crf,
         export_preset=args.export_preset,
+        batch_workers=args.workers,
     )
 
     if args.preflight:
@@ -1205,6 +1626,7 @@ def main(argv=None):
         args.skip_enhancement,
         providers,
         args.progress_every,
+        args.workers,
         quality_settings,
     )
     return None
