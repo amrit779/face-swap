@@ -2,6 +2,8 @@
 
 This project swaps a face from a source image into one or more target videos using InsightFace for detection and identity embeddings, then optionally restores selected swapped frames with GFPGAN.
 
+Use this project only with consent and clear disclosure. See [Responsible Use](RESPONSIBLE_USE.md) before processing or sharing generated media.
+
 The current pipeline is tuned for Apple Silicon and includes:
 
 - CoreML-first ONNX Runtime execution when available
@@ -109,6 +111,8 @@ Batch directory example:
 	--target target \
 	--output output
 ```
+
+More example input and output layouts are available in [EXAMPLES.md](EXAMPLES.md).
 
 ## Preflight
 
@@ -222,6 +226,15 @@ FACE_SWAP_LOG_LEVEL=DEBUG ./swap_env/bin/python swap_script.py
 - The script includes a compatibility shim for newer torchvision releases so GFPGAN and RealESRGAN import cleanly.
 - The final output keeps the original audio track by exporting with ffmpeg.
 - Final export quality depends on the input video quality. Re-encoding cannot restore detail that is not present in the source.
+
+## Project Documents
+
+- [License](LICENSE)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Responsible Use](RESPONSIBLE_USE.md)
+- [GitHub Topics](GITHUB_TOPICS.md)
 
 ## Troubleshooting
 
